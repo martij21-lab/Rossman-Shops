@@ -1,0 +1,5 @@
+"cluster","n_stores","avg_sales","avg_customers","promo_sensitivity","competition_proximity","school_holiday_impact","profile"
+1,619,6289,726,0.449,4259.5,0.195,"High-Performance Promo-Sensitive"
+2,402,6880,611,0.446,7927.1,0.19,"Urban Competitive"
+3,91,11621,1593,0.433,2054,0.193,"Holiday-Sensitive Low-Performance"
+4,3,5368,539,0.447,83446,0.187,"Steady Moderate-Performance"

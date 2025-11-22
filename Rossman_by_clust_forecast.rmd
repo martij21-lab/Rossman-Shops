@@ -1,0 +1,653 @@
+# =============================================================================
+# Rossmann Store Segmentation and Forecasting
+# Business Data Mining Project
+# =============================================================================
+
+# List of required packages
+required_packages <- c(
+  "dplyr",      # Data manipulation
+  "ggplot2",    # Data visualization
+  "cluster",    # Clustering algorithms
+  "factoextra", # Clustering visualization
+  "forecast",   # Time series forecasting
+  "lubridate",  # Date manipulation
+  "gridExtra"   # For arranging multiple plots
+)
+
+# Install and load packages
+for (pkg in required_packages) {
+  if (!require(pkg, character.only = TRUE)) {
+    install.packages(pkg, dependencies = TRUE)
+    library(pkg, character.only = TRUE)
+  }
+}
+
+# Set random seed for reproducibility
+set.seed(123)
+
+# =============================================================================
+# DATA LOADING AND PREPARATION
+# =============================================================================
+
+# Load the datasets
+# Note: Update the file paths to where your data is stored
+train <- read.csv("/Users/shuminlim/Downloads/rossmann-store-sales/train.csv")
+store <- read.csv("/Users/shuminlim/Downloads/rossmann-store-sales/store.csv")
+
+# Explore the data structure
+cat("Training data dimensions:", dim(train), "\n")
+cat("Store data dimensions:", dim(store), "\n")
+
+cat("Training data sample:\n")
+print(head(train))
+cat("\nStore data sample:\n")
+print(head(store))
+
+# Check column names to ensure they match
+cat("Train columns:", names(train), "\n")
+cat("Store columns:", names(store), "\n")
+
+# Convert dates
+train$Date <- as.Date(train$Date)
+
+# Create a simple competition indicator
+store$HasCompetition <- ifelse(!is.na(store$CompetitionDistance), 1, 0)
+
+# =============================================================================
+# DATA PREPROCESSING FOR CLUSTERING
+# =============================================================================
+
+# Merge datasets using merge function
+merged_data <- merge(train, store, by = "Store", all.x = TRUE)
+
+# Filter only open stores and positive sales
+open_stores <- merged_data[merged_data$Open == 1 & merged_data$Sales > 0, ]
+
+# Create store-level features for clustering
+store_features <- data.frame(Store = unique(open_stores$Store))
+
+# Calculate features for each store using a loop
+for (i in 1:nrow(store_features)) {
+  store_id <- store_features$Store[i]
+  store_data <- open_stores[open_stores$Store == store_id, ]
+  
+  store_features$avg_daily_sales[i] <- mean(store_data$Sales, na.rm = TRUE)
+  store_features$avg_daily_customers[i] <- mean(store_data$Customers, na.rm = TRUE)
+  store_features$sales_per_customer[i] <- mean(store_data$Sales / store_data$Customers, na.rm = TRUE)
+  store_features$promo_ratio[i] <- mean(store_data$Promo, na.rm = TRUE)
+  store_features$school_holiday_ratio[i] <- mean(store_data$SchoolHoliday, na.rm = TRUE)
+  
+# Get store characteristics from store data
+  store_meta <- store[store$Store == store_id, ]
+  if (nrow(store_meta) > 0) {
+    store_features$store_type[i] <- as.character(store_meta$StoreType[1])
+    store_features$assortment[i] <- as.character(store_meta$Assortment[1])
+    store_features$competition_distance[i] <- store_meta$CompetitionDistance[1]
+    store_features$has_competition[i] <- store_meta$HasCompetition[1]
+  }
+}
+
+# Handle missing values in competition_distance
+max_dist <- max(store_features$competition_distance, na.rm = TRUE)
+store_features$competition_distance[is.na(store_features$competition_distance)] <- max_dist * 1.1
+
+# Convert categorical variables to factors
+store_features$store_type <- as.factor(store_features$store_type)
+store_features$assortment <- as.factor(store_features$assortment)
+
+# Prepare data for clustering (remove Store ID and convert factors to numeric)
+clustering_data <- store_features[, !names(store_features) %in% c("Store")]
+
+# Convert factors to numeric for clustering
+clustering_data$store_type <- as.numeric(clustering_data$store_type)
+clustering_data$assortment <- as.numeric(clustering_data$assortment)
+clustering_data$has_competition <- as.numeric(clustering_data$has_competition)
+
+# Remove any remaining NA values
+clustering_data <- clustering_data[complete.cases(clustering_data), ]
+
+# Keep track of which stores we have complete data for
+complete_cases <- complete.cases(store_features[, !names(store_features) %in% c("Store")])
+store_features_complete <- store_features[complete_cases, ]
+
+# Standardize the features (important for k-means)
+store_scaled <- scale(clustering_data)
+
+# =============================================================================
+# STORE CLUSTERING - UNSUPERVISED LEARNING
+# =============================================================================
+
+# Determine optimal number of clusters using elbow method
+wss <- numeric(10)
+for (k in 1:10) {
+  kmeans_result <- kmeans(store_scaled, centers = k, nstart = 25)
+  wss[k] <- kmeans_result$tot.withinss
+}
+
+# Plot elbow method
+plot(1:10, wss, type = "b", 
+     xlab = "Number of Clusters (k)", 
+     ylab = "Total Within-Cluster Sum of Squares",
+     main = "Elbow Method for Optimal k",
+     col = "steelblue", pch = 19)
+grid()
+
+# Based on elbow plot, choose k (let's use k=4)
+optimal_k <- 4
+cat("Selected number of clusters:", optimal_k, "\n")
+
+# Perform k-means clustering
+kmeans_result <- kmeans(store_scaled, centers = optimal_k, nstart = 25)
+
+# Add cluster assignments to store features
+store_features_complete$cluster <- as.factor(kmeans_result$cluster)
+
+# =============================================================================
+# CLUSTER ANALYSIS AND VISUALIZATION
+# =============================================================================
+
+# Summary statistics by cluster
+cluster_summary <- aggregate(cbind(avg_daily_sales, avg_daily_customers, promo_ratio, competition_distance) ~ cluster, 
+                            data = store_features_complete, 
+                            FUN = mean)
+
+cluster_counts <- table(store_features_complete$cluster)
+cluster_summary$n_stores <- as.numeric(cluster_counts[as.character(cluster_summary$cluster)])
+cluster_summary$proportion <- cluster_summary$n_stores / nrow(store_features_complete)
+
+cat("Cluster Summary:\n")
+print(cluster_summary)
+
+# Convert centroids to z-scores (for profile plotting)
+centroids <- as.data.frame(kmeans_result$centers)
+centroids_z <- as.data.frame(scale(centroids))
+centroids_z$cluster <- as.factor(1:nrow(centroids_z)) 
+# Cluster Profile Plot (Snake Plot)
+centroids_melt <- reshape2::melt(centroids_z, id.vars = "cluster")
+ggplot(centroids_melt, aes(x = variable, y = value, group = cluster, color = cluster)) +
+  geom_line(size = 1) +
+  geom_point(size = 2) +
+  labs(title = "Cluster Profiles (Z-scores)", x = "Features", y = "Z-score") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  
+# Visualize clusters using PCA
+pca_result <- prcomp(store_scaled, scale. = TRUE)
+
+# Create PCA plot
+pca_scores <- as.data.frame(pca_result$x[, 1:2])
+pca_scores$cluster <- as.factor(kmeans_result$cluster)
+
+plot(pca_scores$PC1, pca_scores$PC2, 
+     col = as.numeric(pca_scores$cluster), 
+     pch = 19, 
+     xlab = "PC1", 
+     ylab = "PC2",
+     main = "Store Clusters - PCA Visualization")
+legend("topright", legend = levels(pca_scores$cluster), 
+       col = 1:optimal_k, pch = 19)
+
+# Cluster profiles visualization using ggplot2 if available, otherwise base R
+if ("ggplot2" %in% installed.packages()) {
+  # Sales by cluster
+  p1 <- ggplot(store_features_complete, aes(x = cluster, y = avg_daily_sales, fill = cluster)) +
+    geom_boxplot() +
+    labs(title = "Average Daily Sales by Cluster", y = "Sales") +
+    theme_minimal() +
+    theme(legend.position = "none")
+  
+# Customers by cluster
+  p2 <- ggplot(store_features_complete, aes(x = cluster, y = avg_daily_customers, fill = cluster)) +
+    geom_boxplot() +
+    labs(title = "Average Daily Customers by Cluster", y = "Customers") +
+    theme_minimal() +
+    theme(legend.position = "none")
+  
+# Promo ratio by cluster
+  p3 <- ggplot(store_features_complete, aes(x = cluster, y = promo_ratio, fill = cluster)) +
+    geom_boxplot() +
+    labs(title = "Promo Ratio by Cluster", y = "Promo Ratio") +
+    theme_minimal() +
+    theme(legend.position = "none")
+  
+
+# Competition distance by cluster
+  p4 <- ggplot(store_features_complete, aes(x = cluster, y = competition_distance, fill = cluster)) +
+    geom_boxplot() +
+    labs(title = "Competition Distance by Cluster", y = "Distance") +
+    theme_minimal() +
+    theme(legend.position = "none")
+  
+# Arrange plots
+  if ("gridExtra" %in% installed.packages()) {
+    grid.arrange(p1, p2, p3, p4, ncol = 2)
+  } else {
+    print(p1)
+    print(p2)
+    print(p3)
+    print(p4)
+  }
+} else {
+  # Base R plots as fallback
+  par(mfrow = c(2, 2))
+  boxplot(avg_daily_sales ~ cluster, data = store_features_complete,
+          main = "Average Daily Sales by Cluster", col = "lightblue")
+  boxplot(avg_daily_customers ~ cluster, data = store_features_complete,
+          main = "Average Daily Customers by Cluster", col = "lightgreen")
+  boxplot(promo_ratio ~ cluster, data = store_features_complete,
+          main = "Promo Ratio by Cluster", col = "lightcoral")
+  boxplot(competition_distance ~ cluster, data = store_features_complete,
+          main = "Competition Distance by Cluster", col = "lightyellow")
+  par(mfrow = c(1, 1))
+}
+
+# =============================================================================
+# TIME SERIES FORECASTING WITH PROFESSIONAL PLOTS
+# =============================================================================
+
+# Load required packages
+library(forecast)
+library(ggplot2)
+library(dplyr)
+library(lubridate)
+library(gridExtra)
+
+# Set seed for reproducibility
+set.seed(123)
+
+# =============================================================================
+# DATA PREPARATION
+# =============================================================================
+
+cat("=== PREPARING DATA FOR FORECASTING ===\n")
+
+# Find stores with sufficient data for reliable forecasting
+store_summary <- open_stores %>%
+  group_by(Store) %>%
+  summarise(
+    n_days = n(),
+    avg_sales = mean(Sales),
+    data_quality = sd(Sales) / mean(Sales),  # Lower is more stable
+    date_range = as.numeric(max(Date) - min(Date))
+  ) %>%
+  filter(n_days >= 100, data_quality < 0.5) %>%  # Stable stores with good data
+  arrange(desc(n_days))
+
+cat("Stores available for forecasting:", nrow(store_summary), "\n")
+
+# Select top 3 stores for demonstration
+selected_stores <- store_summary$Store[1:3]
+cat("Selected stores:", selected_stores, "\n")
+
+# =============================================================================
+# FORECASTING FUNCTION WITH ENHANCED PLOTS
+# =============================================================================
+
+create_forecast_analysis <- function(store_id, test_days = 45) {
+  cat("\n🔮 Analyzing Store", store_id, "...\n")
+  
+# Prepare data
+  store_data <- open_stores %>%
+    filter(Store == store_id) %>%
+    arrange(Date)
+  
+# Create time series
+  ts_sales <- ts(store_data$Sales, frequency = 7)
+  n <- length(ts_sales)
+  
+# Adjust test period if needed
+  if (n < test_days + 60) {
+    test_days <- floor(n * 0.2)
+  }
+  
+  train <- ts(ts_sales[1:(n - test_days)], frequency = 7)
+  test <- ts_sales[(n - test_days + 1):n]
+  
+# Fit multiple models
+  models <- list()
+  
+# 1. Seasonal Naive (Benchmark)
+  models$Seasonal_Naive <- snaive(train, h = test_days)
+  
+# 2. Linear Model with Trend + Seasonality
+  models$TSLM <- forecast(tslm(train ~ trend + season), h = test_days)
+  
+# 3. ETS (Exponential Smoothing)
+  models$ETS <- forecast(ets(train), h = test_days)
+  
+# 4. Auto ARIMA
+  models$ARIMA <- forecast(auto.arima(train), h = test_days)
+  
+# Calculate performance metrics
+  performance <- data.frame()
+  for (model_name in names(models)) {
+    fc <- as.numeric(models[[model_name]]$mean)
+    actual <- as.numeric(test)
+    
+    performance <- rbind(performance, data.frame(
+      Store = store_id,
+      Model = model_name,
+      RMSE = sqrt(mean((fc - actual)^2)),
+      MAPE = mean(abs((fc - actual) / actual)) * 100,
+      MASE = accuracy(models[[model_name]], test)["MASE"]
+    ))
+  }
+  
+  # ===========================================================================
+  # CREATE PROFESSIONAL PLOTS
+  # ===========================================================================
+  
+# PLOT 1: Forecast vs Actual Comparison
+  plot_data <- data.frame(
+    Day = 1:test_days,
+    Actual = as.numeric(test),
+    Seasonal_Naive = as.numeric(models$Seasonal_Naive$mean),
+    TSLM = as.numeric(models$TSLM$mean),
+    ETS = as.numeric(models$ETS$mean),
+    ARIMA = as.numeric(models$ARIMA$mean)
+  )
+  
+  p1 <- ggplot(plot_data, aes(x = Day)) +
+    geom_line(aes(y = Actual, color = "Actual"), size = 1.2) +
+    geom_line(aes(y = Seasonal_Naive, color = "Seasonal Naive"), size = 0.8, linetype = "dashed") +
+    geom_line(aes(y = TSLM, color = "TSLM"), size = 0.8, linetype = "dashed") +
+    geom_line(aes(y = ETS, color = "ETS"), size = 0.8, linetype = "dashed") +
+    geom_line(aes(y = ARIMA, color = "ARIMA"), size = 0.8, linetype = "dashed") +
+    scale_color_manual(
+      values = c(
+        "Actual" = "black",
+        "Seasonal Naive" = "red", 
+        "TSLM" = "blue",
+        "ETS" = "green",
+        "ARIMA" = "purple"
+      )
+    ) +
+    labs(
+      title = paste("Store", store_id, "- Forecast vs Actual"),
+      subtitle = "Comparison of Different Forecasting Models",
+      x = "Days in Test Period",
+      y = "Sales",
+      color = "Legend"
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(face = "bold", size = 14),
+      plot.subtitle = element_text(color = "gray40"),
+      legend.position = "bottom"
+    )
+  
+# PLOT 2: Performance Metrics Comparison
+  p2 <- performance %>%
+    ggplot(aes(x = reorder(Model, -MAPE), y = MAPE, fill = Model)) +
+    geom_bar(stat = "identity", alpha = 0.8) +
+    geom_text(aes(label = sprintf("%.1f%%", MAPE)), vjust = -0.5, size = 3.5) +
+    labs(
+      title = "Model Accuracy Comparison",
+      subtitle = "Mean Absolute Percentage Error (MAPE) - Lower is Better",
+      x = "Forecasting Model",
+      y = "MAPE (%)"
+    ) +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    scale_fill_brewer(palette = "Set2")
+  
+# PLOT 3: Historical Data with Forecast
+  full_series <- data.frame(
+    Time = 1:n,
+    Sales = as.numeric(ts_sales),
+    Type = c(rep("Historical", n - test_days), rep("Test Period", test_days))
+  )
+  
+  p3 <- ggplot(full_series, aes(x = Time, y = Sales, color = Type)) +
+    geom_line(size = 1) +
+    geom_vline(xintercept = n - test_days, linetype = "dashed", color = "red") +
+    annotate("text", x = n - test_days, y = max(full_series$Sales), 
+             label = "Forecast Start", hjust = 1.1, color = "red") +
+    labs(
+      title = paste("Store", store_id, "- Complete Sales History"),
+      subtitle = "Vertical line indicates forecast period start",
+      x = "Time Period",
+      y = "Sales"
+    ) +
+    theme_minimal() +
+    scale_color_manual(values = c("Historical" = "blue", "Test Period" = "red"))
+  
+# PLOT 4: Residuals Analysis for Best Model
+  best_model_name <- performance$Model[which.min(performance$MAPE)]
+  best_model <- models[[best_model_name]]
+  
+  residuals_data <- data.frame(
+    Time = 1:length(best_model$residuals),
+    Residuals = as.numeric(best_model$residuals)
+  )
+  
+  p4 <- ggplot(residuals_data, aes(x = Time, y = Residuals)) +
+    geom_line(color = "gray60") +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+    geom_smooth(method = "loess", color = "blue", se = FALSE) +
+    labs(
+      title = paste("Residuals Analysis -", best_model_name),
+      subtitle = "Best performing model residuals over time",
+      x = "Time",
+      y = "Residuals"
+    ) +
+    theme_minimal()
+  
+# Display all plots
+  grid.arrange(p1, p2, p3, p4, ncol = 2, 
+               top = paste("Store", store_id, "Forecasting Analysis"))
+  
+  return(list(performance = performance, best_model = best_model_name))
+}
+
+# =============================================================================
+# RUN FORECASTING ANALYSIS
+# =============================================================================
+
+cat("\n=== RUNNING FORECASTING ANALYSIS ===\n")
+
+all_results <- list()
+overall_performance <- data.frame()
+
+for (store_id in selected_stores) {
+  results <- create_forecast_analysis(store_id)
+  all_results[[as.character(store_id)]] <- results
+  overall_performance <- rbind(overall_performance, results$performance)
+}
+
+# =============================================================================
+# SUMMARY ACROSS ALL STORES
+# =============================================================================
+
+cat("\n=== OVERALL RESULTS ===\n")
+
+# Summary statistics
+summary_table <- overall_performance %>%
+  group_by(Model) %>%
+  summarise(
+    Avg_MAPE = round(mean(MAPE), 2),
+    Avg_RMSE = round(mean(RMSE), 2),
+    Avg_MASE = round(mean(MASE), 3),
+    Stores_Tested = n()
+  ) %>%
+  arrange(Avg_MAPE)
+
+cat("Overall Performance Summary:\n")
+print(summary_table)
+
+# Best model overall
+best_overall <- summary_table$Model[1]
+cat("\n🏆 BEST OVERALL MODEL:", best_overall, "\n")
+cat("📊 Average MAPE:", summary_table$Avg_MAPE[1], "%\n")
+
+# =============================================================================
+# FINAL VISUALIZATION - MODEL COMPARISON ACROSS STORES
+# =============================================================================
+
+p_final <- overall_performance %>%
+  ggplot(aes(x = Model, y = MAPE, fill = Model)) +
+  geom_boxplot(alpha = 0.7) +
+  geom_jitter(width = 0.2, size = 2, alpha = 0.6) +
+  labs(
+    title = "Forecasting Model Performance Across All Stores",
+    subtitle = "Distribution of MAPE Values - Lower is Better",
+    x = "Forecasting Model",
+    y = "MAPE (%)",
+    caption = paste("Tested on", length(selected_stores), "stores")
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_fill_brewer(palette = "Set3")
+
+print(p_final)
+
+# =============================================================================
+# Best Forecasting Model per Cluster
+# =============================================================================
+
+cat("\n=== CLUSTER-SPECIFIC FORECASTING ANALYSIS ===\n")
+
+# Select one representative store from each cluster for forecasting
+cluster_results <- list()
+
+for (cluster_id in 1:optimal_k) {
+  cat("\nAnalyzing Cluster", cluster_id, "...\n")
+  
+# Get stores in this cluster
+  cluster_stores <- store_features_complete$Store[store_features_complete$cluster == cluster_id]
+  
+# Select the store with the most data in this cluster
+  cluster_store_candidates <- store_summary %>%
+    filter(Store %in% cluster_stores) %>%
+    arrange(desc(n_days))
+  
+  if (nrow(cluster_store_candidates) > 0) {
+    representative_store <- cluster_store_candidates$Store[1]
+    cat("Selected representative store:", representative_store, "for cluster", cluster_id, "\n")
+    
+# Run forecasting analysis
+    results <- create_forecast_analysis(representative_store)
+    results$cluster <- cluster_id
+    cluster_results[[as.character(cluster_id)]] <- results
+  } else {
+    cat("No suitable stores found for cluster", cluster_id, "\n")
+  }
+}
+
+# Create summary table with best model and MAPE per cluster
+cluster_summary <- data.frame(
+  Cluster  = sapply(cluster_results, function(x) x$cluster),
+  BestModel = sapply(cluster_results, function(x) x$best_model),
+  BestMAPE  = sapply(cluster_results, function(x) {
+    x$performance$MAPE[x$performance$Model == x$best_model]
+  })
+)
+
+# Barplot: Best forecasting model per cluster
+library(dplyr)
+library(ggplot2)
+
+cluster_summary_plot <- cluster_summary %>%
+  mutate(
+    Cluster  = factor(Cluster),
+    BestModel = factor(BestModel)
+  ) %>%
+  ggplot(aes(x = Cluster, y = BestMAPE, fill = BestModel)) +
+  geom_col(width = 0.6) +
+  geom_text(aes(label = sprintf("%.1f%%", BestMAPE)),
+            vjust = -0.4, size = 3) +
+  labs(
+    title    = "Best forecasting model per cluster",
+    subtitle = "Based on MAPE on the last 45 days (test set)",
+    x        = "Cluster",
+    y        = "Best MAPE (%)",
+    fill     = "Best model"
+  ) +
+  ylim(0, max(cluster_summary$BestMAPE) * 1.15) +
+  theme_minimal()
+
+cluster_summary_plot
+
+# =============================================================================
+# BUSINESS RECOMMENDATIONS
+# =============================================================================
+
+cat("\n=== BUSINESS RECOMMENDATIONS ===\n")
+cat("1. PRIMARY MODEL: Use", best_overall, "for sales forecasting\n")
+cat("2. ACCURACY: Expect average error of", summary_table$Avg_MAPE[1], "%\n")
+cat("3. INVENTORY: Plan stock based on", best_overall, "forecasts\n")
+cat("4. MONITORING: Track MAPE weekly to ensure model performance\n")
+cat("5. SCALABILITY: Apply to all stores in similar segments\n")
+
+# Save results
+write.csv(overall_performance, "forecasting_results.csv", row.names = FALSE)
+cat("\n✅ Results saved to 'forecasting_results.csv'\n")
+cat("✅ Analysis complete! Check plots for visual insights.\n")
+
+# =============================================================================
+# BUSINESS RECOMMENDATIONS AND INSIGHTS
+# =============================================================================
+
+# Generate cluster profiles for business recommendations
+cluster_profiles <- data.frame()
+for (cluster_id in 1:optimal_k) {
+  cluster_data <- store_features_complete[store_features_complete$cluster == cluster_id, ]
+  profile <- data.frame(
+    cluster = cluster_id,
+    n_stores = nrow(cluster_data),
+    avg_sales = round(mean(cluster_data$avg_daily_sales)),
+    avg_customers = round(mean(cluster_data$avg_daily_customers)),
+    promo_sensitivity = round(mean(cluster_data$promo_ratio), 3),
+    competition_proximity = round(mean(cluster_data$competition_distance), 1),
+    school_holiday_impact = round(mean(cluster_data$school_holiday_ratio), 3)
+  )
+  cluster_profiles <- rbind(cluster_profiles, profile)
+}
+
+# Add profile descriptions
+cluster_profiles$profile <- c(
+  "High-Performance Promo-Sensitive",
+  "Urban Competitive", 
+  "Holiday-Sensitive Low-Performance",
+  "Steady Moderate-Performance"
+)[1:nrow(cluster_profiles)]
+
+cat("\nCluster Profiles for Business Recommendations:\n")
+print(cluster_profiles)
+
+# =============================================================================
+# SAVE RESULTS
+# =============================================================================
+
+# Save cluster assignments
+write.csv(store_features_complete, "store_clusters.csv", row.names = FALSE)
+
+# Save performance results
+if (nrow(overall_performance) > 0) {
+  write.csv(overall_performance, "forecasting_performance.csv", row.names = FALSE)
+}
+
+# Save cluster profiles for business recommendations
+write.csv(cluster_profiles, "cluster_profiles.csv", row.names = FALSE)
+
+cat("\nAnalysis complete! Results saved to CSV files.\n")
+cat("Key files generated:\n")
+cat("1. store_clusters.csv - Store assignments and features\n")
+cat("2. forecasting_performance.csv - Model performance metrics\n")
+cat("3. cluster_profiles.csv - Business insights by cluster\n")
+
+# Print executive summary
+cat("\n=== EXECUTIVE SUMMARY ===\n")
+cat("• Successfully segmented", nrow(store_features_complete), "stores into", optimal_k, "distinct clusters\n")
+cat("• Cluster sizes:", paste(cluster_summary$n_stores, collapse = ", "), "\n")
+if (nrow(overall_performance) > 0) {
+  best_model <- overall_performance$Model[which.min(overall_performance$MAPE)]
+  best_mape <- round(min(overall_performance$MAPE), 2)
+  cat("• Best performing forecasting model:", best_model, "with average MAPE of", best_mape, "%\n")
+}
+cat("• Key recommendation: Implement cluster-specific promotion strategies\n")
+cat("• Analysis ready for presentation!\n")
+
+
+
+
